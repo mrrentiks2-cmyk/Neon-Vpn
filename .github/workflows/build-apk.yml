@@ -1,0 +1,91 @@
+name: Build APK
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Unpack project archive (if the repo contains only a zip)
+        run: |
+          if [ ! -f settings.gradle ]; then
+            Z=$(ls NeonVPN*.zip 2>/dev/null | head -n1); [ -z "$Z" ] && Z=$(ls *.zip 2>/dev/null | head -n1)
+            if [ -z "$Z" ]; then echo "В корне репозитория нет ни проекта, ни zip-архива"; exit 1; fi
+            unzip -DD -o -q "$Z" -d _unz
+            S=$(find _unz -maxdepth 3 -name settings.gradle | head -n1)
+            if [ -z "$S" ]; then echo "В архиве не найден settings.gradle"; exit 1; fi
+            cp -a "$(dirname "$S")"/. .
+          fi
+
+      - name: Download Xray core (libv2ray.aar)
+        run: |
+          mkdir -p app/libs
+          if [ ! -s app/libs/libv2ray.aar ]; then
+            curl -fL --retry 4 --retry-delay 5 -o app/libs/libv2ray.aar \
+              "https://github.com/2dust/AndroidLibXrayLite/releases/download/v26.9.30/libv2ray.aar" \
+            || curl -fL --retry 4 --retry-delay 5 -o app/libs/libv2ray.aar \
+              "https://github.com/2dust/AndroidLibXrayLite/releases/latest/download/libv2ray.aar"
+          fi
+          ls -la app/libs
+          unzip -l app/libs/libv2ray.aar | grep -E "classes.jar|jni/arm64-v8a|\.dat" || true
+
+      - name: Add geoip/geosite if the core has none
+        run: |
+          if ! unzip -l app/libs/libv2ray.aar | grep -q "geosite.dat"; then
+            mkdir -p app/src/main/assets
+            curl -fL --retry 4 -o app/src/main/assets/geoip.dat https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat
+            curl -fL --retry 4 -o app/src/main/assets/geosite.dat https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat
+          fi
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Build APK
+        run: |
+          chmod +x gradlew
+          set -o pipefail
+          ./gradlew assembleRelease --no-daemon --stacktrace 2>&1 | tee build.log
+
+      - name: Show build error
+        if: failure()
+        run: |
+          {
+            echo "### Ошибка сборки — скопируйте этот текст"
+            echo '~~~'
+            grep -i -E "error:|What went wrong|FAILED|cannot find symbol|Could not|not found" build.log | grep -v "^\s*at " | head -40 || true
+            echo "-----"
+            awk '/What went wrong/{f=1} f{print; n++} n>30{exit}' build.log || true
+            echo '~~~'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: build-log
+          path: build.log
+
+      - name: Collect APK
+        run: cp app/build/outputs/apk/release/app-release.apk NeonVPN.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: NeonVPN-apk
+          path: NeonVPN.apk
+
+      - name: Publish APK to Releases (direct download)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: vpn-build-${{ github.run_number }}
+          name: Neon VPN — сборка ${{ github.run_number }}
+          body: Скачайте NeonVPN.apk ниже и установите на телефон. Новые сборки ставятся поверх старой — подписки и настройки сохраняются.
+          files: NeonVPN.apk
+          make_latest: true
